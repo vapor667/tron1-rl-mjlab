@@ -46,3 +46,29 @@ def pos_commands_ranges_level(
 
     # return the mean terrain level
     return torch.ones(1, dtype=torch.float) * x
+
+
+def vel_commands_ranges_level(
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | slice,
+        max_range: dict[str, tuple[float, float]],
+        update_interval: int = 80 * 24,
+        command_name: str = "base_velocity",
+) -> torch.Tensor:
+    command_cfg = env.command_manager.get_term(command_name).cfg
+    vel_x = command_cfg.ranges.vel_x[1]
+
+    if (env.common_step_counter + 1) % update_interval == 0:
+        vel_x = min(command_cfg.ranges.vel_x[1] + 0.05, max_range["vel_x"][1])
+        vel_y = min(command_cfg.ranges.vel_y[1] + 0.05, max_range["vel_y"][1])
+        vel_yaw = min(command_cfg.ranges.vel_yaw[1] + 0.1, max_range["vel_yaw"][1])
+
+        command_cfg.ranges.vel_x = (-vel_x, vel_x)
+        command_cfg.ranges.vel_y = (-vel_y, vel_y)
+        command_cfg.ranges.vel_yaw = (-vel_yaw, vel_yaw)
+
+        if getattr(command_cfg.ranges, "heading", None) is not None and "heading" in max_range:
+            heading = min(command_cfg.ranges.heading[1] + 0.1, max_range["heading"][1])
+            command_cfg.ranges.heading = (-heading, heading)
+
+    return torch.ones(1, dtype=torch.float, device=env.device) * vel_x

@@ -6,11 +6,57 @@ import torch
 
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
+
+def _get_body_ids(env: ManagerBasedRlEnv, asset: Entity, asset_cfg: SceneEntityCfg) -> list[int] | torch.Tensor:
+    body_ids = asset_cfg.body_ids
+    if isinstance(body_ids, slice):
+        if body_ids == slice(None) and hasattr(env, "_wheels_link_ids"):
+            return env._wheels_link_ids
+        start, stop, step = body_ids.indices(asset.data.body_link_pos_w.shape[1])
+        return list(range(start, stop, step))
+    if body_ids is not None:
+        if isinstance(body_ids, int):
+            return [body_ids]
+        return body_ids
+    if hasattr(env, "_wheels_link_ids"):
+        return env._wheels_link_ids
+    return []
+
+
+def _num_ids(ids: list[int] | torch.Tensor) -> int:
+    if isinstance(ids, torch.Tensor):
+        return int(ids.numel())
+    return len(ids)
+
+
+def _get_joint_limits(asset: Entity):
+    lower = getattr(asset.data, "joint_lower_limits", None)
+    upper = getattr(asset.data, "joint_upper_limits", None)
+
+    if lower is None or upper is None:
+        joint_limits = getattr(asset.data, "joint_limits", None)
+        if joint_limits is not None:
+            lower = joint_limits[..., 0]
+            upper = joint_limits[..., 1]
+
+    if lower is None or upper is None:
+        soft_limits = getattr(asset.data, "soft_joint_pos_limits", None)
+        if soft_limits is not None:
+            lower = soft_limits[..., 0]
+            upper = soft_limits[..., 1]
+
+    return lower, upper
+
+
+def stay_alive(env: ManagerBasedRlEnv) -> torch.Tensor:
+    return torch.ones(env.num_envs, device=env.device)
 
 
 def safety_reward_exp(
@@ -126,6 +172,64 @@ def track_base_reference_exp(
     return torch.exp(-track_error / std ** 2) * 0.5 * env._loco_safety_scale
 
 
+def stand_still_velocity(
+        env: ManagerBasedRlEnv,
+        command_name: str = "base_velocity",
+        lin_threshold: float = 0.05,
+        ang_threshold: float = 0.05,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    commands = env.command_manager.get_command(command_name)
+
+    lin_motion = torch.sum(
+        torch.abs(asset.data.root_link_lin_vel_b[:, :2]) * (torch.norm(commands[:, :2], dim=1, keepdim=True) < lin_threshold),
+        dim=-1,
+    )
+    ang_motion = torch.abs(asset.data.root_link_ang_vel_b[:, 2]) * (torch.abs(commands[:, 2]) < ang_threshold)
+    return lin_motion + ang_motion
+
+
+def track_lin_vel_xy_exp(
+        env: ManagerBasedRlEnv,
+        std: float,
+        command_name: str = "base_velocity",
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    commands = env.command_manager.get_command(command_name)
+    lin_vel_error = torch.sum(torch.square(commands[:, :2] - asset.data.root_link_lin_vel_b[:, :2]), dim=1)
+    return torch.exp(-lin_vel_error / std ** 2)
+
+
+def track_ang_vel_z_exp(
+        env: ManagerBasedRlEnv,
+        std: float,
+        command_name: str = "base_velocity",
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    commands = env.command_manager.get_command(command_name)
+    ang_vel_error = torch.square(commands[:, 2] - asset.data.root_link_ang_vel_b[:, 2])
+    return torch.exp(-ang_vel_error / std ** 2)
+
+
+def lin_vel_z_l2(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.square(asset.data.root_link_lin_vel_b[:, 2])
+
+
+def ang_vel_xy_l2(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=1)
+
+
 def joint_vel_l2(
         env: ManagerBasedRlEnv,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -133,6 +237,160 @@ def joint_vel_l2(
     """Penalize joint velocities on the articulation using L2 squared kernel."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
+
+
+def joint_torques_l2(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    if not asset.data.is_actuated:
+        return torch.zeros(env.num_envs, device=env.device)
+    return torch.sum(torch.square(asset.data.actuator_force[:, asset_cfg.joint_ids]), dim=1)
+
+
+def joint_acc_l2(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.joint_acc[:, asset_cfg.joint_ids]), dim=1)
+
+
+def action_rate_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+    current_action = env.action_manager.action
+    prev_action = getattr(env.action_manager, "prev_action", None)
+    if prev_action is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return torch.sum(torch.square(current_action - prev_action), dim=1)
+
+
+def joint_pos_limits(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    lower, upper = _get_joint_limits(asset)
+    if lower is None or upper is None:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    joint_ids = asset_cfg.joint_ids
+    joint_pos = asset.data.joint_pos[:, joint_ids]
+    lower = lower[..., joint_ids]
+    upper = upper[..., joint_ids]
+
+    if lower.ndim > 1:
+        lower = lower[0]
+    if upper.ndim > 1:
+        upper = upper[0]
+
+    below = torch.clamp(lower - joint_pos, min=0.0)
+    above = torch.clamp(joint_pos - upper, min=0.0)
+    return torch.sum(below + above, dim=1)
+
+
+def undesired_contacts(
+        env: ManagerBasedRlEnv,
+        sensor_cfg: SceneEntityCfg,
+        threshold: float,
+) -> torch.Tensor:
+    sensor: ContactSensor = env.scene[sensor_cfg.name]
+    if sensor.data.force is None:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    contact_force = torch.linalg.norm(sensor.data.force, dim=-1)
+    return torch.sum(contact_force > threshold, dim=1).float()
+
+
+def flat_orientation_l2(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+
+def base_com_height(
+        env: ManagerBasedRlEnv,
+        target_height: float,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    body_ids = _get_body_ids(env, asset, asset_cfg)
+
+    if _num_ids(body_ids) == 0:
+        base_height = asset.data.root_link_pos_w[:, 2]
+    else:
+        foot_height = asset.data.body_link_pos_w[:, body_ids, 2].mean(dim=1)
+        foot_radius = getattr(env, "_foot_radius", 0.0)
+        base_height = asset.data.root_link_pos_w[:, 2] - foot_height + foot_radius
+
+    return torch.abs(base_height - target_height)
+
+
+def feet_distance(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        feet_links_name: list[str] = ["wheel_[RL]_Link"],
+        min_feet_distance: float = 0.1,
+        max_feet_distance: float = 1.0,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    feet_link_ids: list[int] = []
+    for body_name in feet_links_name:
+        body_ids, _ = asset.find_bodies(body_name)
+        feet_link_ids.extend([int(body_id) for body_id in body_ids])
+    feet_pos = asset.data.body_link_pos_w[:, feet_link_ids]
+    feet_distance_xy = torch.norm(feet_pos[:, 0, :2] - feet_pos[:, 1, :2], dim=-1)
+
+    reward = torch.clamp(min_feet_distance - feet_distance_xy, min=0.0, max=1.0)
+    reward += torch.clamp(feet_distance_xy - max_feet_distance, min=0.0, max=1.0)
+    return reward
+
+
+def leg_symmetry(
+        env: ManagerBasedRlEnv,
+        std: float,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    body_ids = _get_body_ids(env, asset, asset_cfg)
+    if _num_ids(body_ids) != 2:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    feet_pos_w = asset.data.body_link_pos_w[:, body_ids]
+    base_quat = asset.data.root_link_quat_w.unsqueeze(1).expand(-1, 2, -1)
+    base_pos = asset.data.root_link_pos_w.unsqueeze(1).expand(-1, 2, -1)
+    feet_pos_b = quat_apply_inverse(base_quat, feet_pos_w - base_pos)
+    symmetry_error = torch.abs(feet_pos_b[:, 0, 1]) - torch.abs(feet_pos_b[:, 1, 1])
+    return torch.exp(-torch.square(symmetry_error) / std ** 2)
+
+
+def same_feet_x_position(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    body_ids = _get_body_ids(env, asset, asset_cfg)
+    if _num_ids(body_ids) != 2:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    feet_pos_w = asset.data.body_link_pos_w[:, body_ids]
+    base_quat = asset.data.root_link_quat_w.unsqueeze(1).expand(-1, 2, -1)
+    base_pos = asset.data.root_link_pos_w.unsqueeze(1).expand(-1, 2, -1)
+    feet_pos_b = quat_apply_inverse(base_quat, feet_pos_w - base_pos)
+    return torch.abs(feet_pos_b[:, 0, 0] - feet_pos_b[:, 1, 0])
+
+
+def joint_powers_l1(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    if not asset.data.is_actuated:
+        return torch.zeros(env.num_envs, device=env.device)
+    joint_ids = asset_cfg.joint_ids
+    return torch.sum(torch.abs(asset.data.actuator_force[:, joint_ids] * asset.data.joint_vel[:, joint_ids]), dim=1)
 
 
 def weighted_joint_torques_l2(
