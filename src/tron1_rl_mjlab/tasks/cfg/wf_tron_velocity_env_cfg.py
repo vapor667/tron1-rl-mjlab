@@ -306,8 +306,8 @@ def make_events() -> dict[str, EventTermCfg]:
 			func=mdp.reset_joints_by_offset,
 			mode="reset",
 			params={
-				"position_range": (-0.2, 0.2),
-				"velocity_range": (-0.5, 0.5),
+				"position_range": (-0.5, 0.5),
+				"velocity_range": (-1.0, 1.0),
 			},
 		),
 		# '''
