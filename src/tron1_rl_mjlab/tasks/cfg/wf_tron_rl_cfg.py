@@ -86,6 +86,6 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             desired_kl=0.01,
             max_grad_norm=1.0,
             num_proprio_encoder_substeps=1,
-            grad_penalty_coef_schedule=[0.002, 0.002, 0, 1],
+            grad_penalty_coef_schedule=[0.002, 0.002, 0, 1], # None
         ),
     )

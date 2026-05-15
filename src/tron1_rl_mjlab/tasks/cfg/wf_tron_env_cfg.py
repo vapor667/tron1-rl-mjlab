@@ -16,7 +16,7 @@ from mjlab.utils.noise import GaussianNoiseCfg
 from mjlab.viewer import ViewerConfig
 
 from ...assets.wf_tron.wf_tron import WF_TRON_ROBOT_CFG
-from .terrain_cfg import TERRAINS_ENTITY_CFG, PLANE_ENTITY_CFG
+from .terrain_cfg import TERRAINS_ENTITY_CFG, PLANE_ENTITY_CFG, TERRAINS_PLAY_ENTITY_CFG
 from .. import mdp
 
 SCENE_CFG = SceneCfg(
@@ -44,15 +44,16 @@ def make_commands() -> dict[str, CommandTermCfg]:
             body_name="base_Link",
             resampling_time_range=(5.0, 10.0),
             resampling_time_scale=(0.5, 5.0),
+            rel_standing_envs=0.02,
             debug_vis=True,
             ranges=mdp.UniformWorldPoseCommandCfg.Ranges(
                 # pos lin
-                pos_x=(-0.2, 0.2),  # min max [m]
-                pos_y=(-0.2, 0.2),  # min max [m]
-                # vel
-                vel_x=(-0.0, 0.0),  # min max [m/s] in target frame
-                vel_y=(-0.0, 0.0),  # min max [m/s] in target frame
-                vel_yaw=(-0.0, 0.0),  # min max [rad/s]
+                    pos_x=(-2.0, 2.0),
+                    pos_y=(-2.0, 2.0),
+                    # vel
+                    vel_x=(-1.0, 1.0),
+                    vel_y=(-1.0, 1.0),
+                    vel_yaw=(-2.0, 2.0),
             ),
             se3_decrease_vel_range=(0.5, 1.4),
         )
@@ -183,7 +184,7 @@ def make_events() -> dict[str, EventTermCfg]:
             func=mdp.dr.body_mass,
             mode="startup",
             params={
-                "ranges": (-0.5, 2.0),
+                "ranges": (-2.0, 5.0), #5.0
                 "operation": "add",
                 "distribution": "uniform",
                 "asset_cfg": SceneEntityCfg("robot", body_names="base_Link"),
@@ -199,6 +200,15 @@ def make_events() -> dict[str, EventTermCfg]:
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_[LR]_Link"),
             },
         ),
+        "randomize_rigid_body_mass_inertia": EventTermCfg(
+			func=mdp.dr.pseudo_inertia,
+			mode="startup",
+			params={
+				"asset_cfg": SceneEntityCfg("robot"),
+				"d_range": (0.8, 1.2),
+				"distribution": "uniform",
+			},
+		),
         "robot_physics_material": EventTermCfg(
             func=mdp.dr.geom_friction,
             mode="startup",
@@ -213,14 +223,28 @@ def make_events() -> dict[str, EventTermCfg]:
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
             },
         ),
+        "robot_joint_stiffness_and_damping": EventTermCfg(
+			func=mdp.dr.pd_gains,
+			mode="startup",
+			params={
+				"asset_cfg": SceneEntityCfg(
+					"robot",
+					actuator_ids=[0],
+				),
+				"kp_range": (32.0, 48.0),
+				"kd_range": (2.0, 3.0),
+				"operation": "abs",
+				"distribution": "uniform",
+			},
+		),
         "robot_center_of_mass": EventTermCfg(
             func=mdp.dr.body_com_offset,
             mode="startup",
             params={
                 "ranges": {
-                    0: (-0.03, 0.03),  # X axis
-                    1: (-0.03, 0.03),  # Y axis
-                    2: (-0.03, 0.03),  # Z axis
+                    0: (-0.075, 0.075),
+					1: (-0.075, 0.075),
+					2: (-0.075, 0.075),
                 },
                 "operation": "add",
                 "distribution": "uniform",
@@ -255,7 +279,7 @@ def make_events() -> dict[str, EventTermCfg]:
             func=mdp.dr.joint_stiffness,
             mode="startup",
             params={
-                "ranges": (0.8, 1.2),
+                "ranges": (0.5, 2.0), #(0.5, 2.0)
                 "operation": "scale",
                 "distribution": "log_uniform",
                 "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
@@ -265,7 +289,7 @@ def make_events() -> dict[str, EventTermCfg]:
             func=mdp.dr.joint_damping,
             mode="startup",
             params={
-                "ranges": (0.8, 1.2),
+                "ranges": (0.5, 2.0), #(0.5, 2.0)
                 "operation": "scale",
                 "distribution": "log_uniform",
                 "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
@@ -275,7 +299,7 @@ def make_events() -> dict[str, EventTermCfg]:
         "push_robot": EventTermCfg(
             func=mdp.push_by_setting_velocity,
             mode="interval",
-            interval_range_s=(10.0, 15.0),
+            interval_range_s=(5.0, 10.0),
             params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}}
         ),
     }
@@ -288,7 +312,7 @@ def make_rewards() -> dict[str, RewardTermCfg]:
         "safety_exp": RewardTermCfg(
             func=mdp.safety_reward_exp,
             weight=1.0,
-            params={"base_height_target": 0.9, "std": math.sqrt(0.5)}
+            params={"base_height_target": 0.8, "std": math.sqrt(0.5)}
         ),
         # tasks
         "track_base_position_exp": RewardTermCfg(
@@ -348,8 +372,8 @@ def make_rewards() -> dict[str, RewardTermCfg]:
                 }
             },
         ),
-        "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.002),
-        "action_smoothness": RewardTermCfg(func=mdp.action_smoothness_penalty, weight=-0.006),
+        "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
+        "action_smoothness": RewardTermCfg(func=mdp.action_smoothness_penalty, weight=-0.06),
         "dof_vel_wheel_l2": RewardTermCfg(
             func=mdp.joint_vel_l2,
             weight=-0.0005,
@@ -445,6 +469,7 @@ def make_wf_tron_play_env_cfg() -> ManagerBasedRlEnvCfg:
     """Factory function to create WF-TRON environment configuration for play."""
     env_cfg = deepcopy(make_wf_tron_env_cfg())
     env_cfg.scene.num_envs = 4
+    env_cfg.scene.terrain = TERRAINS_PLAY_ENTITY_CFG
     env_cfg.commands["base_pose"].ranges = deepcopy(
         env_cfg.curriculum["pos_commands_ranges_level"].params["max_range"]
     )
