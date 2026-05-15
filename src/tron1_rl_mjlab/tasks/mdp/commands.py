@@ -165,7 +165,6 @@ class UniformWorldPoseCommand(UniformPoseCommand):
         self.pos_improvement = torch.zeros(self.num_envs, device=self.device)
         self.orient_improvement = torch.zeros(self.num_envs, device=self.device)
         self.is_standing_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.is_velocity_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Velocity commands: sampled in target pose frame, transformed to body frame for observation
         self.pose_command_vel_c = torch.zeros(
@@ -293,18 +292,6 @@ class UniformWorldPoseCommand(UniformPoseCommand):
         self.is_standing_env[env_ids] = (
             sample_uniform(0.0, 1.0, len(env_ids), device=self.device) < self.cfg.rel_standing_envs
         )
-        self.is_velocity_env[env_ids] = (
-            sample_uniform(0.0, 1.0, len(env_ids), device=self.device) < self.cfg.rel_velocity_envs
-        )
-
-        velocity_mask = self.is_velocity_env[env_ids]
-        if torch.any(velocity_mask):
-            velocity_env_ids = env_ids[velocity_mask]
-            self.pose_command_w[velocity_env_ids, :3] = self.robot.data.root_link_pos_w[velocity_env_ids]
-            velocity_quat = self.robot.data.root_link_quat_w[velocity_env_ids]
-            self.pose_command_w[velocity_env_ids, 3:] = (
-                quat_unique(velocity_quat) if self.cfg.make_quat_unique else velocity_quat
-            )
 
         standing_mask = self.is_standing_env[env_ids]
         if torch.any(standing_mask):
@@ -350,16 +337,6 @@ class UniformWorldPoseCommand(UniformPoseCommand):
             self.time_left[env_ids] = (se3_error * random_scale).clip(
                 min=self.resample_time_range[0], max=self.resample_time_range[1]
             )
-            velocity_mask = self.is_velocity_env[env_ids]
-            if torch.any(velocity_mask):
-                velocity_env_ids = env_ids[velocity_mask]
-                velocity_time = sample_uniform(
-                    self.cfg.velocity_resampling_time_range[0],
-                    self.cfg.velocity_resampling_time_range[1],
-                    len(velocity_env_ids),
-                    device=self.device,
-                )
-                self.time_left[velocity_env_ids] = velocity_time
             # increment the command counter
             self.command_counter[env_ids] += 1
 
@@ -369,8 +346,6 @@ class UniformWorldPoseCommandCfg(UniformPoseCommandCfg):
     se3_decrease_vel_range: tuple[float, float] = (0.5, 1.4)
     resampling_time_scale: tuple[float, float] = (6.0, 15.0)
     rel_standing_envs: float = 0.0
-    rel_velocity_envs: float = 0.5
-    velocity_resampling_time_range: tuple[float, float] = (3.0, 15.0)
 
     @dataclass
     class Ranges:
@@ -390,3 +365,148 @@ class UniformWorldPoseCommandCfg(UniformPoseCommandCfg):
 
     def build(self, env: ManagerBasedRlEnv) -> UniformWorldPoseCommand:
         return UniformWorldPoseCommand(self, env)
+
+
+def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def _yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
+    qw, qx, qy, qz = torch.unbind(quat, dim=-1)
+    return torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+
+class UniformVelocityCommand(CommandTerm):
+    cfg: UniformVelocityCommandCfg
+
+    def __init__(self, cfg: UniformVelocityCommandCfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+
+        self.robot: Entity = env.scene[cfg.entity_name]
+        self.vel_command_b = torch.zeros(self.num_envs, 3, device=self.device)
+        self.heading_target = torch.zeros(self.num_envs, device=self.device)
+        self.is_heading_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.is_standing_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        self.metrics["lin_vel_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["ang_vel_error"] = torch.zeros(self.num_envs, device=self.device)
+
+    def __str__(self) -> str:
+        msg = "UniformVelocityCommand:\n"
+        msg += f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"
+        msg += f"\tResampling time range: {self.cfg.resampling_time_range}\n"
+        msg += f"\tHeading command: {self.cfg.heading_command}\n"
+        return msg
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self.vel_command_b
+
+    def _update_metrics(self) -> None:
+        self.metrics["lin_vel_error"] = torch.norm(
+            self.vel_command_b[:, :2] - self.robot.data.root_link_lin_vel_b[:, :2], dim=-1
+        )
+        self.metrics["ang_vel_error"] = torch.abs(
+            self.vel_command_b[:, 2] - self.robot.data.root_link_ang_vel_b[:, 2]
+        )
+
+    def _apply_standing_mask(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            self.vel_command_b[self.is_standing_env] = 0.0
+            return
+
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        standing_mask = self.is_standing_env[env_ids]
+        if torch.any(standing_mask):
+            self.vel_command_b[env_ids[standing_mask]] = 0.0
+
+    def _resample_command(self, env_ids: Sequence[int]) -> None:
+        if len(env_ids) == 0:
+            return
+
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        r = torch.empty(len(env_ids), device=self.device)
+        self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.vel_x)
+        self.vel_command_b[env_ids, 1] = r.uniform_(*self.cfg.ranges.vel_y)
+        self.vel_command_b[env_ids, 2] = r.uniform_(*self.cfg.ranges.vel_yaw)
+
+        self.is_standing_env[env_ids] = (
+            sample_uniform(0.0, 1.0, len(env_ids), device=self.device) < self.cfg.rel_standing_envs
+        )
+
+        if self.cfg.heading_command:
+            self.is_heading_env[env_ids] = (
+                sample_uniform(0.0, 1.0, len(env_ids), device=self.device) < self.cfg.rel_heading_envs
+            )
+            heading_range = self.cfg.ranges.heading
+            if heading_range is not None:
+                self.heading_target[env_ids] = r.uniform_(*heading_range)
+            else:
+                self.heading_target[env_ids] = _yaw_from_quat(self.robot.data.root_link_quat_w[env_ids])
+        else:
+            self.is_heading_env[env_ids] = False
+
+        self._apply_standing_mask(env_ids)
+
+    def _update_command(self) -> None:
+        if self.cfg.heading_command and torch.any(self.is_heading_env):
+            heading_env_ids = torch.nonzero(self.is_heading_env, as_tuple=False).squeeze(-1)
+            current_heading = _yaw_from_quat(self.robot.data.root_link_quat_w[heading_env_ids])
+            heading_error = _wrap_to_pi(self.heading_target[heading_env_ids] - current_heading)
+            yaw_command = self.cfg.heading_control_stiffness * heading_error
+            self.vel_command_b[heading_env_ids, 2] = torch.clamp(
+                yaw_command,
+                min=self.cfg.ranges.vel_yaw[0],
+                max=self.cfg.ranges.vel_yaw[1],
+            )
+
+        self._apply_standing_mask()
+
+    def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
+        for env_idx in visualizer.get_env_indices(self.num_envs):
+            root_pos_w = self.robot.data.root_link_pos_w[env_idx].detach().cpu()
+            root_quat_w = self.robot.data.root_link_quat_w[env_idx].detach().cpu().unsqueeze(0)
+            cmd_vel_b = self.vel_command_b[env_idx].detach().cpu()
+
+            start = root_pos_w + root_pos_w.new_tensor([0.0, 0.0, 0.2])
+
+            lin_cmd_b = cmd_vel_b.new_tensor([cmd_vel_b[0], cmd_vel_b[1], 0.0]).unsqueeze(0)
+            lin_cmd_w = quat_apply(root_quat_w, lin_cmd_b).squeeze(0)
+            visualizer.add_arrow(
+                start=start,
+                end=start + 0.5 * lin_cmd_w,
+                color=(0.2, 0.6, 1.0, 0.8),
+                width=0.012,
+                label=f"vel_cmd_lin_{env_idx}",
+            )
+
+            yaw_cmd_b = cmd_vel_b.new_tensor([0.0, 0.0, cmd_vel_b[2]]).unsqueeze(0)
+            yaw_cmd_w = quat_apply(root_quat_w, yaw_cmd_b).squeeze(0)
+            visualizer.add_arrow(
+                start=start,
+                end=start + 0.25 * yaw_cmd_w,
+                color=(0.1, 1.0, 0.4, 0.8),
+                width=0.01,
+                label=f"vel_cmd_yaw_{env_idx}",
+            )
+
+
+@dataclass(kw_only=True)
+class UniformVelocityCommandCfg(CommandTermCfg):
+    entity_name: str
+    heading_command: bool = False
+    heading_control_stiffness: float = 1.0
+    rel_standing_envs: float = 0.0
+    rel_heading_envs: float = 1.0
+
+    @dataclass
+    class Ranges:
+        vel_x: tuple[float, float]
+        vel_y: tuple[float, float]
+        vel_yaw: tuple[float, float]
+        heading: tuple[float, float] | None = None
+
+    ranges: Ranges
+
+    def build(self, env: ManagerBasedRlEnv) -> UniformVelocityCommand:
+        return UniformVelocityCommand(self, env)
