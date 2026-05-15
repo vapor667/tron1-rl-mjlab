@@ -46,7 +46,7 @@ TERRAIN_SCAN_SENSOR_CFG = RayCastSensorCfg(
 
 
 SCENE_CFG = SceneCfg(
-	num_envs=1, #4096,
+	num_envs=4096,
 	extent=1.0,
 	terrain=TERRAINS_ENTITY_CFG,
 	sensors=(CONTACT_FORCES_SENSOR_CFG, TERRAIN_SCAN_SENSOR_CFG),
