@@ -443,6 +443,9 @@ class PPO:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            actor_distribution = getattr(self.actor, "distribution", None)
+            if actor_distribution is not None:
+                actor_distribution.enforce_constraints()
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()

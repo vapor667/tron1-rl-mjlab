@@ -16,3 +16,7 @@ wheels/
 # Logs
 logs/
 wandb/
+
+.codex
+issues/
+training.log

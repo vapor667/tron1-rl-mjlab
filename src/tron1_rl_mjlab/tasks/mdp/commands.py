@@ -164,6 +164,8 @@ class UniformWorldPoseCommand(UniformPoseCommand):
         self.optim_orient_distance = torch.zeros(self.num_envs, device=self.device)
         self.pos_improvement = torch.zeros(self.num_envs, device=self.device)
         self.orient_improvement = torch.zeros(self.num_envs, device=self.device)
+        self.is_standing_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.is_velocity_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Velocity commands: sampled in target pose frame, transformed to body frame for observation
         self.pose_command_vel_c = torch.zeros(
@@ -212,7 +214,7 @@ class UniformWorldPoseCommand(UniformPoseCommand):
         self.metrics["orientation_error"] = rot_error_angle
 
         self.se3_distance_ref[env_ids] = (
-                2 * self.metrics["position_error"][env_ids] + self.metrics["orientation_error"][env_ids]
+            2 * self.metrics["position_error"][env_ids] + self.metrics["orientation_error"][env_ids]
         )
         self.optim_pos_distance[env_ids] = self.metrics["position_error"][env_ids]
         self.optim_orient_distance[env_ids] = self.metrics["orientation_error"][env_ids]
@@ -256,6 +258,10 @@ class UniformWorldPoseCommand(UniformPoseCommand):
             self.pose_command_w[:, 3:] = quat_unique(self.pose_command_w[:, 3:])
 
     def _resample_command(self, env_ids: Sequence[int]):
+        if len(env_ids) == 0:
+            return
+
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         # sample new pose targets
         # -- position
         r = torch.empty(len(env_ids), device=self.device)
@@ -283,6 +289,34 @@ class UniformWorldPoseCommand(UniformPoseCommand):
             self.pose_command_vel_c[env_ids, 0] = r.uniform_(*self.cfg.ranges.vel_x)
             self.pose_command_vel_c[env_ids, 1] = r.uniform_(*self.cfg.ranges.vel_y)
             self.pose_command_vel_c[env_ids, 2] = r.uniform_(*self.cfg.ranges.vel_yaw)
+
+        self.is_standing_env[env_ids] = (
+            sample_uniform(0.0, 1.0, len(env_ids), device=self.device) < self.cfg.rel_standing_envs
+        )
+        self.is_velocity_env[env_ids] = (
+            sample_uniform(0.0, 1.0, len(env_ids), device=self.device) < self.cfg.rel_velocity_envs
+        )
+
+        velocity_mask = self.is_velocity_env[env_ids]
+        if torch.any(velocity_mask):
+            velocity_env_ids = env_ids[velocity_mask]
+            self.pose_command_w[velocity_env_ids, :3] = self.robot.data.root_link_pos_w[velocity_env_ids]
+            velocity_quat = self.robot.data.root_link_quat_w[velocity_env_ids]
+            self.pose_command_w[velocity_env_ids, 3:] = (
+                quat_unique(velocity_quat) if self.cfg.make_quat_unique else velocity_quat
+            )
+
+        standing_mask = self.is_standing_env[env_ids]
+        if torch.any(standing_mask):
+            standing_env_ids = env_ids[standing_mask]
+            self.pose_command_w[standing_env_ids, :3] = self.robot.data.root_link_pos_w[standing_env_ids]
+            standing_quat = self.robot.data.root_link_quat_w[standing_env_ids]
+            self.pose_command_w[standing_env_ids, 3:] = (
+                quat_unique(standing_quat) if self.cfg.make_quat_unique else standing_quat
+            )
+            if (hasattr(self.cfg.ranges, 'vel_x') and hasattr(self.cfg.ranges, 'vel_y')
+                    and hasattr(self.cfg.ranges, 'vel_yaw')):
+                self.pose_command_vel_c[standing_env_ids] = 0.0
 
     def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
         for env_idx in visualizer.get_env_indices(self.num_envs):
@@ -316,6 +350,16 @@ class UniformWorldPoseCommand(UniformPoseCommand):
             self.time_left[env_ids] = (se3_error * random_scale).clip(
                 min=self.resample_time_range[0], max=self.resample_time_range[1]
             )
+            velocity_mask = self.is_velocity_env[env_ids]
+            if torch.any(velocity_mask):
+                velocity_env_ids = env_ids[velocity_mask]
+                velocity_time = sample_uniform(
+                    self.cfg.velocity_resampling_time_range[0],
+                    self.cfg.velocity_resampling_time_range[1],
+                    len(velocity_env_ids),
+                    device=self.device,
+                )
+                self.time_left[velocity_env_ids] = velocity_time
             # increment the command counter
             self.command_counter[env_ids] += 1
 
@@ -324,6 +368,9 @@ class UniformWorldPoseCommand(UniformPoseCommand):
 class UniformWorldPoseCommandCfg(UniformPoseCommandCfg):
     se3_decrease_vel_range: tuple[float, float] = (0.5, 1.4)
     resampling_time_scale: tuple[float, float] = (6.0, 15.0)
+    rel_standing_envs: float = 0.0
+    rel_velocity_envs: float = 0.5
+    velocity_resampling_time_range: tuple[float, float] = (3.0, 15.0)
 
     @dataclass
     class Ranges:

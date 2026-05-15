@@ -59,10 +59,7 @@ class TSModel(nn.Module):
 
     During teacher mode (training), the actor uses the privileged encoder (fed privileged
     critic observations) to compute a latent representation. During student mode (deployment),
-    the proprioceptive encoder (fed observation history) is used instead.
-
-    This model follows the same interface as ``MLPModel`` and can be used as a drop-in
-    replacement via the ``actor_class``/``critic_class`` config fields.
+    the proprioceptive encoder (fed observation history OR raw actor obs) is used instead.
 
     The obs TensorDict is expected to contain the following keys (configurable):
     - ``raw_obs_key`` (default ``"policy"``): actor observations.
@@ -70,8 +67,9 @@ class TSModel(nn.Module):
     - ``privileged_obs_key`` (default ``"critic"``): privileged observations for privileged encoder.
     - ``commands_key`` (default ``"commands"``): command/goal vector.
 
-    For the critic, set ``history_obs_key=None`` to skip creating the proprioceptive encoder
-    (it is not used for value estimation).
+    Compatibility:
+    If ``history_obs_key=None``, the student/proprioceptive encoder falls back to encoding
+    ``raw_obs_key`` instead of history.
     """
 
     is_recurrent: bool = False
@@ -91,7 +89,7 @@ class TSModel(nn.Module):
         hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
         activation: str = "elu",
         distribution_cfg: dict | None = None,
-        **kwargs,  # absorb unused RslRlModelCfg fields (obs_normalization, cnn_cfg, etc.)
+        **kwargs,  # absorb unused RslRlModelCfg fields
     ) -> None:
         super().__init__()
 
@@ -100,16 +98,21 @@ class TSModel(nn.Module):
         self.privileged_obs_key = privileged_obs_key
         self.commands_key = commands_key
         self._student_mode: bool = False
+        
+        # 核心兼容逻辑：如果有 history 就用 history，没有就 fallback 到 raw_obs (actor)
+        self.student_obs_key = history_obs_key if history_obs_key is not None else raw_obs_key
 
         # Compute input dimensions from the obs TensorDict
         raw_obs_dim: int = obs[raw_obs_key].shape[-1]
         privileged_obs_dim: int = obs[privileged_obs_key].shape[-1]
         commands_dim: int = obs[commands_key].shape[-1] if commands_key is not None else 0
+        student_obs_dim: int = obs[self.student_obs_key].shape[-1]
 
         # Store for export helpers
         self._raw_obs_dim = raw_obs_dim
         self._commands_dim = commands_dim
         self._encoder_latent_dim = encoder_latent_dim
+        self._student_obs_dim = student_obs_dim
 
         # Privileged encoder (teacher) — always created
         self.privileged_encoder = Encoder(
@@ -119,19 +122,13 @@ class TSModel(nn.Module):
             activation=activation,
         )
 
-        # Proprioceptive encoder (student) — optional; not needed for the critic
-        if history_obs_key is not None:
-            history_obs_dim: int = obs[history_obs_key].shape[-1]
-            self._history_obs_dim = history_obs_dim
-            self.proprioceptive_encoder: Encoder | None = Encoder(
-                input_dim=history_obs_dim,
-                hidden_dims=encoder_hidden_dims,
-                latent_dim=encoder_latent_dim,
-                activation=activation,
-            )
-        else:
-            self._history_obs_dim = 0
-            self.proprioceptive_encoder = None
+        # Proprioceptive encoder (student) — always created, dynamically sizes to history or actor obs
+        self.proprioceptive_encoder = Encoder(
+            input_dim=student_obs_dim,
+            hidden_dims=encoder_hidden_dims,
+            latent_dim=encoder_latent_dim,
+            activation=activation,
+        )
 
         # Distribution (for stochastic actor; None for deterministic critic)
         mlp_output_dim: int
@@ -152,12 +149,11 @@ class TSModel(nn.Module):
             self.distribution.init_mlp_weights(self.mlp)
 
         print(f"PrivilegedEncoder: {self.privileged_encoder}")
-        if self.proprioceptive_encoder is not None:
-            print(f"ProprioceptiveEncoder: {self.proprioceptive_encoder}")
+        print(f"ProprioceptiveEncoder (encoding '{self.student_obs_key}'): {self.proprioceptive_encoder}")
         print(f"MLP: {self.mlp}")
 
     # ------------------------------------------------------------------ #
-    # MLPModel-compatible interface                                         #
+    # MLPModel-compatible interface                                      #
     # ------------------------------------------------------------------ #
 
     def forward(
@@ -182,10 +178,11 @@ class TSModel(nn.Module):
         masks: torch.Tensor | None = None,
         hidden_state: HiddenState = None,
     ) -> torch.Tensor:
-        if self._student_mode and self.proprioceptive_encoder is not None:
-            encoder_latent = self.proprioceptive_encoder(obs[self.history_obs_key])
+        if self._student_mode:
+            encoder_latent = self.proprioceptive_encoder(obs[self.student_obs_key])
         else:
             encoder_latent = self.privileged_encoder(obs[self.privileged_obs_key])
+            
         parts = [encoder_latent, obs[self.raw_obs_key]]
         if self.commands_key is not None:
             parts.append(obs[self.commands_key])
@@ -228,7 +225,7 @@ class TSModel(nn.Module):
         return self.distribution.kl_divergence(old_params, new_params)  # type: ignore
 
     # ------------------------------------------------------------------ #
-    # Teacher-student specific methods                                     #
+    # Teacher-student specific methods                                   #
     # ------------------------------------------------------------------ #
 
     def use_student_mode(self) -> None:
@@ -240,12 +237,8 @@ class TSModel(nn.Module):
         self._student_mode = False
 
     def proprio_encode(self, obs: TensorDict) -> torch.Tensor:
-        """Encode obs history with the proprioceptive encoder."""
-        if self.proprioceptive_encoder is None:
-            raise RuntimeError(
-                "No proprioceptive_encoder — this model was created with history_obs_key=None."
-            )
-        return self.proprioceptive_encoder(obs[self.history_obs_key])
+        """Encode student observations (history or actor obs) with the proprioceptive encoder."""
+        return self.proprioceptive_encoder(obs[self.student_obs_key])
 
     def privileged_encode(self, obs: TensorDict) -> torch.Tensor:
         """Encode privileged obs with the privileged encoder."""
@@ -268,7 +261,7 @@ class TSModel(nn.Module):
         return result
 
     # ------------------------------------------------------------------ #
-    # Export                                                                #
+    # Export                                                             #
     # ------------------------------------------------------------------ #
 
     def as_jit(self) -> nn.Module:
@@ -283,13 +276,11 @@ class TSModel(nn.Module):
 class _TorchTSStudentModel(nn.Module):
     """JIT-exportable student inference model.
 
-    Takes three separate tensors (obs_history, raw_obs, commands) and returns actions.
+    Takes three separate tensors (obs_history/student_obs, raw_obs, commands) and returns actions.
     """
 
     def __init__(self, model: TSModel) -> None:
         super().__init__()
-        if model.proprioceptive_encoder is None:
-            raise ValueError("Cannot export student model: history_obs_key was set to None.")
         self.proprio_encoder = copy.deepcopy(model.proprioceptive_encoder)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
@@ -299,7 +290,7 @@ class _TorchTSStudentModel(nn.Module):
 
     def forward(
         self,
-        obs_history: torch.Tensor,
+        obs_history: torch.Tensor,  # Note: this represents raw_obs if history is disabled
         raw_obs: torch.Tensor,
         commands: torch.Tensor,
     ) -> torch.Tensor:
@@ -320,8 +311,6 @@ class _OnnxTSStudentModel(nn.Module):
 
     def __init__(self, model: TSModel, verbose: bool) -> None:
         super().__init__()
-        if model.proprioceptive_encoder is None:
-            raise ValueError("Cannot export student model: history_obs_key was set to None.")
         self.verbose = verbose
         self.proprio_encoder = copy.deepcopy(model.proprioceptive_encoder)
         self.mlp = copy.deepcopy(model.mlp)
@@ -329,13 +318,14 @@ class _OnnxTSStudentModel(nn.Module):
             self.deterministic_output: nn.Module = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
-        self._obs_history_size = model._history_obs_dim
+            
+        self._student_obs_size = model._student_obs_dim
         self._raw_obs_size = model._raw_obs_dim
         self._commands_size = model._commands_dim
 
     def forward(
         self,
-        obs_history: torch.Tensor,
+        obs_history: torch.Tensor,  # Note: this represents raw_obs if history is disabled
         raw_obs: torch.Tensor,
         commands: torch.Tensor,
     ) -> torch.Tensor:
@@ -346,13 +336,15 @@ class _OnnxTSStudentModel(nn.Module):
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
-            torch.zeros(1, self._obs_history_size),
+            torch.zeros(1, self._student_obs_size),
             torch.zeros(1, self._raw_obs_size),
             torch.zeros(1, self._commands_size),
         )
 
     @property
     def input_names(self) -> list[str]:
+        # Keep "obs_history" name to not break downstream C++ deployment code,
+        # but conceptually it represents whatever the student encoder takes.
         return ["obs_history", "obs", "commands"]
 
     @property
